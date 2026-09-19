@@ -38,7 +38,7 @@ def main():
         out = os.path.join(d, "output")
         res = iu.process_folder(
             files, out, iu.RIGHT_TO_LEFT, threshold=25,
-            crop_mode=iu.CROP_GLOBAL,
+            crop_mode=iu.CROP_GLOBAL, detect_vertical=True,
         )
         print("saved:", res.saved, "skipped_empty:", res.skipped_empty)
         print("errors:", res.errors)
@@ -62,6 +62,18 @@ def main():
         # width 200-30=170 and height 600-40-40=520.
         assert sizes == {(170, 520)}, sizes
 
+        # Default (detect_vertical=False): top/bottom padding is kept, so the
+        # height stays at the full 600 while horizontal padding is still cut.
+        out_novert = os.path.join(d, "output_novert")
+        iu.process_folder(
+            files, out_novert, iu.RIGHT_TO_LEFT, threshold=25,
+            crop_mode=iu.CROP_GLOBAL,  # detect_vertical defaults to False
+        )
+        sizes_nv = {Image.open(os.path.join(out_novert, n)).size
+                    for n in os.listdir(out_novert)}
+        assert sizes_nv == {(170, 600)}, sizes_nv
+        print("no-vertical size (full height kept):", sizes_nv)
+
         # Outlier test: one half with much larger padding must not shrink the
         # others (median ignores it).
         with tempfile.TemporaryDirectory() as d3:
@@ -82,7 +94,7 @@ def main():
             out3 = os.path.join(d3, "output")
             iu.process_folder(
                 all_files, out3, iu.LEFT_TO_RIGHT, threshold=25,
-                crop_mode=iu.CROP_GLOBAL,
+                crop_mode=iu.CROP_GLOBAL, detect_vertical=True,
             )
             sizes3 = {Image.open(os.path.join(out3, n)).size
                       for n in os.listdir(out3)}
@@ -96,7 +108,7 @@ def main():
             out3i = os.path.join(d3, "output_individual")
             iu.process_folder(
                 all_files, out3i, iu.LEFT_TO_RIGHT, threshold=25,
-                crop_mode=iu.CROP_INDIVIDUAL,
+                crop_mode=iu.CROP_INDIVIDUAL, detect_vertical=True,
             )
             sizes3i = {Image.open(os.path.join(out3i, n)).size
                        for n in os.listdir(out3i)}
@@ -113,7 +125,7 @@ def main():
             out3o = os.path.join(d3, "output_override")
             iu.process_folder(
                 all_files, out3o, iu.LEFT_TO_RIGHT, threshold=25,
-                crop_mode=iu.CROP_GLOBAL,
+                crop_mode=iu.CROP_GLOBAL, detect_vertical=True,
                 mode_overrides={outlier: iu.CROP_INDIVIDUAL},
             )
             all_sizes = [Image.open(os.path.join(out3o, n)).size

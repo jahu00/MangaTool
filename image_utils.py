@@ -128,11 +128,15 @@ def content_bbox(
     arr: np.ndarray,
     threshold: int,
     skips: tuple[int, int, int, int] = (0, 0, 0, 0),
+    detect_vertical: bool = False,
 ) -> tuple[int, int, int, int] | None:
     """Bounding box of real content, found by peeling padding from each edge.
 
-    Each of the four edges is peeled independently using its own padding color,
-    so left/right/top/bottom padding may differ and any solid color works.
+    The left and right edges are always peeled independently using each edge's
+    own padding color, so horizontal padding of any solid color works. The top
+    and bottom edges are only peeled when *detect_vertical* is true; otherwise
+    the full image height is kept.
+
     *skips* is ``(left, top, right, bottom)`` pixel bands to ignore (skip past)
     at each edge before detection, useful for UI elements sitting in the
     padding. Returns (left, top, right, bottom) or None if all padding.
@@ -144,8 +148,12 @@ def content_bbox(
     right_pad = _peel_edge(
         arr[:, ::-1, :].transpose(1, 0, 2), threshold, skip_r
     )
-    top = _peel_edge(arr, threshold, skip_t)  # rows T->B
-    bottom_pad = _peel_edge(arr[::-1, :, :], threshold, skip_b)
+    if detect_vertical:
+        top = _peel_edge(arr, threshold, skip_t)  # rows T->B
+        bottom_pad = _peel_edge(arr[::-1, :, :], threshold, skip_b)
+    else:
+        top = 0
+        bottom_pad = 0
 
     right = w - right_pad
     bottom = h - bottom_pad
@@ -167,18 +175,20 @@ def analyze_half(
     skip_outer: int = 0,
     skip_top: int = 0,
     skip_bottom: int = 0,
+    detect_vertical: bool = False,
 ) -> HalfResult:
     """Detect content on a half, skipping a band at the outer/top/bottom edges.
 
     The *outer* edge is the left for a left half and the right for a right
-    half; the inner (spine) edge is never skipped or cropped.
+    half; the inner (spine) edge is never skipped or cropped. Top/bottom
+    margins are only detected when *detect_vertical* is true.
     """
     arr = _half_to_array(half)
     if side == "left":
         skips = (skip_outer, skip_top, 0, skip_bottom)  # (l, t, r, b)
     else:
         skips = (0, skip_top, skip_outer, skip_bottom)
-    bbox = content_bbox(arr, threshold, skips)
+    bbox = content_bbox(arr, threshold, skips, detect_vertical)
     return HalfResult(side=side, bbox=bbox, size=half.size)
 
 
@@ -188,20 +198,25 @@ def analyze_image(
     skip_outer: int = 0,
     skip_top: int = 0,
     skip_bottom: int = 0,
+    detect_vertical: bool = False,
 ) -> ImageAnalysis:
     """Split one image and detect content bounds on each half.
 
     *skip_outer*/*skip_top*/*skip_bottom* ignore a pixel band at those edges
     before detection, so UI elements sitting in the margin don't cut it short.
+    *detect_vertical* enables top/bottom margin detection (off by default, so
+    only the left/right outer margins are trimmed).
     """
     with Image.open(path) as img:
         img = img.convert("RGB")
         left_img, right_img = split_halves(img)
         left = analyze_half(
-            left_img, "left", threshold, skip_outer, skip_top, skip_bottom
+            left_img, "left", threshold,
+            skip_outer, skip_top, skip_bottom, detect_vertical,
         )
         right = analyze_half(
-            right_img, "right", threshold, skip_outer, skip_top, skip_bottom
+            right_img, "right", threshold,
+            skip_outer, skip_top, skip_bottom, detect_vertical,
         )
         return ImageAnalysis(path=path, size=img.size, left=left, right=right)
 
@@ -355,6 +370,7 @@ def process_folder(
     skip_outer: int = 0,
     skip_top: int = 0,
     skip_bottom: int = 0,
+    detect_vertical: bool = False,
     progress=None,
 ) -> ProcessResult:
     """Analyze every file, then split and save according to the crop mode.
@@ -398,7 +414,8 @@ def process_folder(
             try:
                 analyses.append(
                     analyze_image(
-                        path, threshold, skip_outer, skip_top, skip_bottom
+                        path, threshold, skip_outer, skip_top, skip_bottom,
+                        detect_vertical,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - report and continue

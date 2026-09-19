@@ -43,6 +43,8 @@ class SplitterApp(tk.Tk):
         self.skip_outer = tk.IntVar(value=0)
         self.skip_top = tk.IntVar(value=0)
         self.skip_bottom = tk.IntVar(value=0)
+        # Optional top/bottom margin detection (off by default).
+        self.detect_vertical = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Select an input folder to begin.")
 
         self.files: list[str] = []
@@ -153,16 +155,24 @@ class SplitterApp(tk.Tk):
         # short. The inner (spine) edge is never affected.
         skip_row = ttk.Frame(top)
         skip_row.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(
+            skip_row,
+            text="Detect top/bottom margins",
+            variable=self.detect_vertical,
+            command=self._on_detect_vertical_toggle,
+        ).pack(side="left", padx=(0, 16))
         ttk.Label(
             skip_row, text="Skip margin (px) before detection \u2014"
         ).pack(side="left")
-        for label, var in (
-            ("Outer:", self.skip_outer),
-            ("Top:", self.skip_top),
-            ("Bottom:", self.skip_bottom),
+        self._skip_widgets = {}
+        for key, label, var in (
+            ("outer", "Outer:", self.skip_outer),
+            ("top", "Top:", self.skip_top),
+            ("bottom", "Bottom:", self.skip_bottom),
         ):
-            ttk.Label(skip_row, text=label).pack(side="left", padx=(12, 2))
-            ttk.Spinbox(
+            lbl = ttk.Label(skip_row, text=label)
+            lbl.pack(side="left", padx=(12, 2))
+            sb = ttk.Spinbox(
                 skip_row,
                 from_=0,
                 to=100000,
@@ -170,7 +180,9 @@ class SplitterApp(tk.Tk):
                 textvariable=var,
                 width=7,
                 command=self._on_skip_change,
-            ).pack(side="left")
+            )
+            sb.pack(side="left")
+            self._skip_widgets[key] = (lbl, sb)
         ttk.Label(
             skip_row,
             text="(use for UI/overlays in the margin)",
@@ -266,6 +278,7 @@ class SplitterApp(tk.Tk):
 
         # Apply initial enabled/disabled state for the output widgets.
         self._on_cbz_toggle()
+        self._on_detect_vertical_toggle()
 
     # ------------------------------------------------------------ actions
     def _on_cbz_toggle(self):
@@ -448,6 +461,17 @@ class SplitterApp(tk.Tk):
         self._gm_key = None  # skips changed -> recompute consensus margins
         self.update_preview()
 
+    def _on_detect_vertical_toggle(self):
+        # Top/bottom skip only matter when vertical detection is enabled.
+        state = "normal" if self.detect_vertical.get() else "disabled"
+        fg = "#000" if self.detect_vertical.get() else "#bbb"
+        for key in ("top", "bottom"):
+            lbl, sb = self._skip_widgets[key]
+            sb.configure(state=state)
+            lbl.configure(foreground=fg)
+        self._gm_key = None
+        self.update_preview()
+
     def update_preview(self):
         sel = self.tree.selection()
         if not sel:
@@ -456,11 +480,12 @@ class SplitterApp(tk.Tk):
         threshold = self.threshold.get()
         crop_mode = self._effective_mode(path)
         skips = self._skip_values()
+        detect_v = self.detect_vertical.get()
 
         def work():
             try:
                 base = self._build_preview_image(
-                    path, threshold, crop_mode, skips
+                    path, threshold, crop_mode, skips, detect_v
                 )
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda: self.status.set(f"Preview error: {exc}"))
@@ -470,15 +495,19 @@ class SplitterApp(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _global_margins(self, threshold: int, skips: tuple[int, int, int]):
-        """Consensus margins across all files, cached per (files, threshold, skips)."""
-        key = (tuple(self.files), threshold, skips)
+    def _global_margins(
+        self, threshold: int, skips: tuple[int, int, int], detect_v: bool
+    ):
+        """Consensus margins across all files, cached per input parameters."""
+        key = (tuple(self.files), threshold, skips, detect_v)
         if getattr(self, "_gm_key", None) == key:
             return self._gm_value
         analyses = []
         for p in self.files:
             try:
-                analyses.append(iu.analyze_image(p, threshold, *skips))
+                analyses.append(
+                    iu.analyze_image(p, threshold, *skips, detect_v)
+                )
             except Exception:  # noqa: BLE001 - skip unreadable in preview
                 continue
         value = iu.compute_uniform_margins(analyses)
@@ -488,7 +517,7 @@ class SplitterApp(tk.Tk):
 
     def _build_preview_image(
         self, path: str, threshold: int, crop_mode: str,
-        skips: tuple[int, int, int],
+        skips: tuple[int, int, int], detect_v: bool,
     ) -> Image.Image:
         """Return a copy of the source annotated with detection overlays.
 
@@ -496,9 +525,9 @@ class SplitterApp(tk.Tk):
         own content box in individual mode, or the shared consensus box in
         global mode (so the preview matches what will actually be saved).
         """
-        analysis = iu.analyze_image(path, threshold, *skips)
+        analysis = iu.analyze_image(path, threshold, *skips, detect_v)
         global_margins = (
-            self._global_margins(threshold, skips)
+            self._global_margins(threshold, skips, detect_v)
             if crop_mode == iu.CROP_GLOBAL
             else None
         )
@@ -516,9 +545,9 @@ class SplitterApp(tk.Tk):
         if skip_outer > 0:
             draw.rectangle([0, 0, skip_outer, h], fill=shade)          # L outer
             draw.rectangle([w - skip_outer, 0, w, h], fill=shade)      # R outer
-        if skip_top > 0:
+        if detect_v and skip_top > 0:
             draw.rectangle([0, 0, w, skip_top], fill=shade)
-        if skip_bottom > 0:
+        if detect_v and skip_bottom > 0:
             draw.rectangle([0, h - skip_bottom, w, h], fill=shade)
 
         # Split line
@@ -573,6 +602,7 @@ class SplitterApp(tk.Tk):
         out_dir = self._resolve_output_dir()
         cbz_path = self._resolve_cbz_path() if create_cbz else None
         skip_outer, skip_top, skip_bottom = self._skip_values()
+        detect_vertical = self.detect_vertical.get()
 
         self.process_btn.configure(state="disabled")
         self.progress.configure(value=0, maximum=len(self.files) * 2)
@@ -587,7 +617,7 @@ class SplitterApp(tk.Tk):
                     crop_mode=crop_mode, mode_overrides=overrides,
                     create_cbz=create_cbz, cbz_path=cbz_path,
                     skip_outer=skip_outer, skip_top=skip_top,
-                    skip_bottom=skip_bottom,
+                    skip_bottom=skip_bottom, detect_vertical=detect_vertical,
                     progress=on_progress,
                 )
             except Exception as exc:  # noqa: BLE001
