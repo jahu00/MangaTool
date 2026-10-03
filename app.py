@@ -21,6 +21,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
 
 import image_utils as iu
+import presets as pr
 
 
 class SplitterApp(tk.Tk):
@@ -47,6 +48,10 @@ class SplitterApp(tk.Tk):
         self.detect_vertical = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Select an input folder to begin.")
 
+        # Presets (global options, excluding CBZ settings).
+        self.preset_store = pr.PresetStore()
+        self.selected_preset = tk.StringVar(value=pr.DEFAULT_PRESET_NAME)
+
         self.files: list[str] = []
         self.sizes: dict[str, tuple[int, int]] = {}
         # Per-page crop overrides: path -> CROP_GLOBAL/CROP_INDIVIDUAL.
@@ -60,6 +65,12 @@ class SplitterApp(tk.Tk):
         self._preview_photo = None  # keep a reference so it isn't GC'd
 
         self._build_ui()
+
+        # Load the stored Default preset's values at startup (no preview yet,
+        # since no folder is loaded).
+        self._apply_settings(
+            self.preset_store.get(pr.DEFAULT_PRESET_NAME)
+        )
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -193,6 +204,35 @@ class SplitterApp(tk.Tk):
             text="(use for UI/overlays in the margin)",
             foreground="#888",
         ).pack(side="left", padx=(12, 0))
+
+        # Presets row
+        preset_row = ttk.Frame(top)
+        preset_row.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        ttk.Label(preset_row, text="Preset:").pack(side="left")
+        self.preset_combo = ttk.Combobox(
+            preset_row,
+            textvariable=self.selected_preset,
+            values=self.preset_store.names(),
+            state="readonly",
+            width=22,
+        )
+        self.preset_combo.pack(side="left", padx=(4, 8))
+        self.preset_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._apply_selected_preset()
+        )
+        ttk.Button(
+            preset_row, text="Save as...", command=self._save_preset_as
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            preset_row, text="Save", command=self._save_current_preset
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            preset_row, text="Manage...", command=self._open_preset_manager
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            preset_row, text="Reset to defaults",
+            command=self._reset_to_defaults,
+        ).pack(side="left", padx=(12, 2))
 
         # Main split area: file list (left) + preview (right)
         main = ttk.Panedwindow(self, orient="horizontal")
@@ -542,6 +582,121 @@ class SplitterApp(tk.Tk):
         self._menu_target = row
         self.crop_menu.tk_popup(event.x_root, event.y_root)
 
+    # ------------------------------------------------------------ presets
+    def _collect_settings(self) -> dict:
+        """Current global option values as a preset dict (CBZ excluded)."""
+        return pr.sanitize({
+            "desired_height": self._desired_height_value(),
+            "order": self.order.get(),
+            "crop_mode": self.crop_mode.get(),
+            "threshold": self.threshold.get(),
+            "skip_outer": self.skip_outer.get(),
+            "skip_top": self.skip_top.get(),
+            "skip_bottom": self.skip_bottom.get(),
+            "detect_vertical": self.detect_vertical.get(),
+        })
+
+    def _apply_settings(self, settings: dict):
+        """Push a preset dict into the UI variables and refresh dependents."""
+        s = pr.sanitize(settings)
+        self.desired_height.set(str(s["desired_height"]))
+        self.order.set(s["order"])
+        self.crop_mode.set(s["crop_mode"])
+        self.threshold.set(s["threshold"])
+        self.skip_outer.set(s["skip_outer"])
+        self.skip_top.set(s["skip_top"])
+        self.skip_bottom.set(s["skip_bottom"])
+        self.detect_vertical.set(s["detect_vertical"])
+        # Refresh things that react to these values.
+        self._on_detect_vertical_toggle()
+        self.refresh_height_flags()
+        self._refresh_all_crop_cells()
+        self._gm_key = None
+        self.update_preview()
+
+    def _refresh_preset_combo(self):
+        self.preset_combo.configure(values=self.preset_store.names())
+
+    def _apply_selected_preset(self):
+        name = self.selected_preset.get()
+        if self.preset_store.exists(name):
+            self._apply_settings(self.preset_store.get(name))
+            self.status.set(f"Applied preset '{name}'.")
+
+    def _save_current_preset(self):
+        """Overwrite the currently selected preset with current values."""
+        name = self.selected_preset.get()
+        if not self.preset_store.exists(name):
+            # Selection is stale; fall back to Save as.
+            self._save_preset_as()
+            return
+        self.preset_store.set(name, self._collect_settings())
+        self.status.set(f"Saved preset '{name}'.")
+
+    def _save_preset_as(self):
+        name = self._prompt_preset_name()
+        if not name:
+            return
+        if self.preset_store.exists(name):
+            if not messagebox.askyesno(
+                "Overwrite preset",
+                f"A preset named '{name}' already exists. Overwrite it?",
+            ):
+                return
+        self.preset_store.set(name, self._collect_settings())
+        self._refresh_preset_combo()
+        self.selected_preset.set(name)
+        self.status.set(f"Saved preset '{name}'.")
+
+    def _prompt_preset_name(self) -> str | None:
+        """Modal dialog asking for a (non-empty) preset name."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Save preset as")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="Preset name:").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4)
+        )
+        var = tk.StringVar()
+        entry = ttk.Entry(dlg, textvariable=var, width=32)
+        entry.grid(row=1, column=0, columnspan=2, padx=10, sticky="ew")
+        entry.focus_set()
+
+        result: dict = {"name": None}
+
+        def ok():
+            name = var.get().strip()
+            if not name:
+                messagebox.showwarning(
+                    "Invalid name", "Enter a non-empty preset name.",
+                    parent=dlg,
+                )
+                return
+            result["name"] = name
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=2, column=0, columnspan=2, pady=10)
+        ttk.Button(btns, text="Save", command=ok).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(
+            side="left", padx=4
+        )
+        entry.bind("<Return>", lambda _e: ok())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+
+        self.wait_window(dlg)
+        return result["name"]
+
+    def _reset_to_defaults(self):
+        """Set current values to the original factory defaults."""
+        self._apply_settings(pr.ORIGINAL_DEFAULTS)
+        self.status.set("Settings reset to original defaults.")
+
+    def _open_preset_manager(self):
+        PresetManager(self)
+
     # ------------------------------------------------------------ preview
     def _on_threshold_change(self, value):
         self.threshold.set(int(float(value)))
@@ -800,6 +955,122 @@ class SplitterApp(tk.Tk):
             )
         else:
             messagebox.showinfo("Done", summary)
+
+
+class PresetManager(tk.Toplevel):
+    """Window to apply or delete saved presets."""
+
+    def __init__(self, app: "SplitterApp"):
+        super().__init__(app)
+        self.app = app
+        self.store = app.preset_store
+        self.title("Manage presets")
+        self.transient(app)
+        self.geometry("380x320")
+        self.grab_set()
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        list_frame = ttk.Frame(self, padding=10)
+        list_frame.grid(row=0, column=0, sticky="nsew")
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        self.listbox = tk.Listbox(list_frame, activestyle="dotbox")
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(
+            list_frame, orient="vertical", command=self.listbox.yview
+        )
+        self.listbox.configure(yscrollcommand=vsb.set)
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.listbox.bind("<<ListboxSelect>>", lambda _e: self._update_buttons())
+        self.listbox.bind("<Double-Button-1>", lambda _e: self._apply())
+
+        btns = ttk.Frame(self, padding=(10, 0, 10, 10))
+        btns.grid(row=1, column=0, sticky="ew")
+        self.apply_btn = ttk.Button(btns, text="Apply", command=self._apply)
+        self.apply_btn.pack(side="left", padx=4)
+        self.overwrite_btn = ttk.Button(
+            btns, text="Overwrite with current", command=self._overwrite
+        )
+        self.overwrite_btn.pack(side="left", padx=4)
+        self.delete_btn = ttk.Button(
+            btns, text="Delete", command=self._delete
+        )
+        self.delete_btn.pack(side="left", padx=4)
+        ttk.Button(btns, text="Close", command=self.destroy).pack(
+            side="right", padx=4
+        )
+
+        self._reload()
+        self.bind("<Escape>", lambda _e: self.destroy())
+
+    def _reload(self, select: str | None = None):
+        names = self.store.names()
+        self.listbox.delete(0, tk.END)
+        for n in names:
+            label = n + ("  (built-in)" if pr.PresetStore.is_protected(n) else "")
+            self.listbox.insert(tk.END, label)
+        target = select or self.app.selected_preset.get()
+        if target in names:
+            idx = names.index(target)
+            self.listbox.selection_set(idx)
+            self.listbox.see(idx)
+        self._names = names
+        self._update_buttons()
+
+    def _selected_name(self) -> str | None:
+        sel = self.listbox.curselection()
+        if not sel:
+            return None
+        return self._names[sel[0]]
+
+    def _update_buttons(self):
+        name = self._selected_name()
+        has = name is not None
+        protected = has and pr.PresetStore.is_protected(name)
+        self.apply_btn.configure(state="normal" if has else "disabled")
+        self.overwrite_btn.configure(state="normal" if has else "disabled")
+        self.delete_btn.configure(
+            state="disabled" if (not has or protected) else "normal"
+        )
+
+    def _apply(self):
+        name = self._selected_name()
+        if name is None:
+            return
+        self.app._apply_settings(self.store.get(name))
+        self.app.selected_preset.set(name)
+        self.app._refresh_preset_combo()
+        self.app.status.set(f"Applied preset '{name}'.")
+
+    def _overwrite(self):
+        name = self._selected_name()
+        if name is None:
+            return
+        if not messagebox.askyesno(
+            "Overwrite preset",
+            f"Overwrite '{name}' with the current settings?",
+            parent=self,
+        ):
+            return
+        self.store.set(name, self.app._collect_settings())
+        self.app.status.set(f"Saved preset '{name}'.")
+
+    def _delete(self):
+        name = self._selected_name()
+        if name is None or pr.PresetStore.is_protected(name):
+            return
+        if not messagebox.askyesno(
+            "Delete preset", f"Delete preset '{name}'?", parent=self
+        ):
+            return
+        self.store.delete(name)
+        if self.app.selected_preset.get() == name:
+            self.app.selected_preset.set(pr.DEFAULT_PRESET_NAME)
+        self.app._refresh_preset_combo()
+        self._reload(select=pr.DEFAULT_PRESET_NAME)
 
 
 if __name__ == "__main__":
