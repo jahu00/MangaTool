@@ -202,6 +202,54 @@ def main():
         print("skip margin: without", iu.half_margins(a0.left)[0],
               "with", iu.half_margins(a1.left)[0])
 
+        # No-split: a mixed batch where one page is marked no-split. Normal
+        # pages produce 2 halves each; the no-split page produces 1 cropped
+        # whole page. All share the same global crop margins.
+        ns_dir = os.path.join(d, "nosplit_test")
+        os.makedirs(ns_dir)
+        for i in range(2):
+            make_scan(os.path.join(ns_dir, f"{i+1}.png"), 400, 600)
+        whole = os.path.join(ns_dir, "3.png")
+        make_scan(whole, 400, 600)
+        out_ns = os.path.join(ns_dir, "output")
+        res_ns = iu.process_folder(
+            iu.list_image_files(ns_dir), out_ns, iu.LEFT_TO_RIGHT, threshold=25,
+            crop_mode=iu.CROP_GLOBAL, detect_vertical=True,
+            no_split_paths={whole},
+        )
+        # 2 normal x2 halves + 1 whole page = 5 outputs.
+        assert res_ns.saved == 5, res_ns.saved
+        names_ns = sorted(os.listdir(out_ns))
+        assert names_ns == ["1.png", "2.png", "3.png", "4.png", "5.png"], names_ns
+        sizes_ns = [Image.open(os.path.join(out_ns, n)).size for n in names_ns]
+        # Halves crop to 170x520; whole page keeps both halves joined: content
+        # spans x30..370 (both halves have content) -> width 340, height 520.
+        assert sizes_ns.count((170, 520)) == 4, sizes_ns
+        assert (340, 520) in sizes_ns, sizes_ns
+        print("no-split sizes:", sorted(set(sizes_ns)))
+
+        # Skip pages: 2 images, left-to-right order. Skip the right half of the
+        # first and both halves of the second -> only 1 output remains.
+        sk_dir = os.path.join(d, "skip_pages_test")
+        os.makedirs(sk_dir)
+        p1 = os.path.join(sk_dir, "1.png")
+        p2 = os.path.join(sk_dir, "2.png")
+        make_scan(p1, 400, 600)
+        make_scan(p2, 400, 600)
+        out_sk = os.path.join(sk_dir, "output")
+        res_sk = iu.process_folder(
+            [p1, p2], out_sk, iu.LEFT_TO_RIGHT, threshold=25,
+            crop_mode=iu.CROP_GLOBAL, detect_vertical=True,
+            skip_sides={p1: iu.SKIP_RIGHT, p2: iu.SKIP_BOTH},
+        )
+        # p1 keeps only its left half; p2 is fully skipped.
+        assert res_sk.saved == 1, res_sk.saved
+        assert res_sk.skipped_pages == 3, res_sk.skipped_pages
+        names_sk = sorted(os.listdir(out_sk))
+        assert names_sk == ["1.png"], names_sk
+        print("skip-pages saved:", res_sk.saved,
+              "skipped_pages:", res_sk.skipped_pages)
+
     print("ALL OK")
 
 

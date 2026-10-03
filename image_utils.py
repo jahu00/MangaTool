@@ -30,6 +30,29 @@ RIGHT_TO_LEFT = "Right to Left"
 CROP_GLOBAL = "Global (uniform)"       # one consensus crop for every page
 CROP_INDIVIDUAL = "Individual (per page)"  # each page cropped to its own content
 
+# Per-page skip options: which output halves to drop (none by default).
+SKIP_NONE = "None"
+SKIP_LEFT = "Left"
+SKIP_RIGHT = "Right"
+SKIP_BOTH = "Both"
+SKIP_OPTIONS = (SKIP_NONE, SKIP_LEFT, SKIP_RIGHT, SKIP_BOTH)
+
+
+def is_part_skipped(skip: str, side: str) -> bool:
+    """Whether an output part on *side* is skipped under *skip*.
+
+    ``side`` is ``"left"``/``"right"`` for split pages or ``"full"`` for a
+    no-split page. Left/right skips only drop their matching half; ``Both``
+    drops everything, including a no-split whole page.
+    """
+    if skip == SKIP_BOTH:
+        return True
+    if skip == SKIP_LEFT:
+        return side == "left"
+    if skip == SKIP_RIGHT:
+        return side == "right"
+    return False  # SKIP_NONE
+
 
 @dataclass
 class HalfResult:
@@ -46,18 +69,31 @@ class HalfResult:
 
 @dataclass
 class ImageAnalysis:
-    """Detection result for one full image (both halves)."""
+    """Detection result for one image.
+
+    A normal image is analyzed as two halves (*left*/*right*). An image marked
+    *no_split* is analyzed as a single whole page in *full* (both halves left
+    None); it still gets cropped, just not cut down the middle.
+    """
 
     path: str
     size: tuple[int, int]  # (width, height) of the source image
-    left: HalfResult
-    right: HalfResult
+    left: HalfResult | None = None
+    right: HalfResult | None = None
+    full: HalfResult | None = None
+    no_split: bool = False
 
     def ordered_halves(self, order: str) -> list[HalfResult]:
         """Return halves in the requested output order."""
         if order == LEFT_TO_RIGHT:
             return [self.left, self.right]
         return [self.right, self.left]
+
+    def output_parts(self, order: str) -> list[HalfResult]:
+        """Parts that become output pages: the whole page, or ordered halves."""
+        if self.no_split:
+            return [self.full]
+        return self.ordered_halves(order)
 
 
 def natural_key(name: str):
@@ -192,6 +228,25 @@ def analyze_half(
     return HalfResult(side=side, bbox=bbox, size=half.size)
 
 
+def analyze_full(
+    img: Image.Image,
+    threshold: int,
+    skip_outer: int = 0,
+    skip_top: int = 0,
+    skip_bottom: int = 0,
+    detect_vertical: bool = False,
+) -> HalfResult:
+    """Detect content on a whole (un-split) page.
+
+    Both left and right edges are outer edges here (no spine), so *skip_outer*
+    is applied to both. Returns a ``HalfResult`` with side ``"full"``.
+    """
+    arr = _half_to_array(img)
+    skips = (skip_outer, skip_top, skip_outer, skip_bottom)  # (l, t, r, b)
+    bbox = content_bbox(arr, threshold, skips, detect_vertical)
+    return HalfResult(side="full", bbox=bbox, size=img.size)
+
+
 def analyze_image(
     path: str,
     threshold: int,
@@ -199,8 +254,13 @@ def analyze_image(
     skip_top: int = 0,
     skip_bottom: int = 0,
     detect_vertical: bool = False,
+    no_split: bool = False,
 ) -> ImageAnalysis:
-    """Split one image and detect content bounds on each half.
+    """Detect content bounds for one image.
+
+    When *no_split* is false the image is split into left/right halves and each
+    is analyzed. When true the whole image is analyzed as a single page (still
+    cropped, just not cut in half).
 
     *skip_outer*/*skip_top*/*skip_bottom* ignore a pixel band at those edges
     before detection, so UI elements sitting in the margin don't cut it short.
@@ -209,6 +269,14 @@ def analyze_image(
     """
     with Image.open(path) as img:
         img = img.convert("RGB")
+        if no_split:
+            full = analyze_full(
+                img, threshold, skip_outer, skip_top, skip_bottom,
+                detect_vertical,
+            )
+            return ImageAnalysis(
+                path=path, size=img.size, full=full, no_split=True
+            )
         left_img, right_img = split_halves(img)
         left = analyze_half(
             left_img, "left", threshold,
@@ -239,6 +307,24 @@ def half_margins(half: HalfResult) -> tuple[int, int, int] | None:
     return (outer, top, bottom)
 
 
+def margin_samples(part: HalfResult) -> list[tuple[int, int, int]]:
+    """Outer-margin samples contributed by a part for consensus computation.
+
+    A left/right half contributes one ``(outer, top, bottom)`` sample. A full
+    (no-split) page has padding on *both* horizontal edges, so it contributes
+    two outer samples (left and right) sharing the same top/bottom.
+    """
+    if part is None or part.bbox is None:
+        return []
+    l, t, r, b = part.bbox
+    w, h = part.size
+    top, bottom = t, h - b
+    if part.side == "full":
+        return [(l, top, bottom), (w - r, top, bottom)]
+    m = half_margins(part)
+    return [m] if m is not None else []
+
+
 def _median_int(values: list[int]) -> int:
     s = sorted(values)
     n = len(s)
@@ -262,9 +348,9 @@ def compute_uniform_margins(
     tops: list[int] = []
     bottoms: list[int] = []
     for a in analyses:
-        for half in (a.left, a.right):
-            m = half_margins(half)
-            if m is not None:
+        parts = (a.full,) if a.no_split else (a.left, a.right)
+        for part in parts:
+            for m in margin_samples(part):
                 outers.append(m[0])
                 tops.append(m[1])
                 bottoms.append(m[2])
@@ -288,6 +374,9 @@ def crop_box_from_margins(
     if top + bottom >= h:  # degenerate: skip vertical crop
         top = bottom = 0
     outer = max(0, min(outer, w - 1))
+    if side == "full":  # no-split page: trim both horizontal edges
+        right = max(outer + 1, w - outer)
+        return (outer, top, right, h - bottom)
     if side == "left":
         return (outer, top, w, h - bottom)  # keep inner (right) edge
     return (0, top, w - outer, h - bottom)  # keep inner (left) edge
@@ -297,12 +386,15 @@ def outer_crop_box_for_half(half: HalfResult) -> tuple[int, int, int, int] | Non
     """Per-half crop box using that half's own detected margins.
 
     This is the *individual* crop: only outer padding is trimmed and the inner
-    (spine) edge is kept. Returns None for an empty half.
+    (spine) edge is kept. For a full (no-split) page both horizontal edges are
+    trimmed to the detected content. Returns None for an empty part.
     """
     if half.bbox is None:
         return None
     l, t, r, b = half.bbox
     w, h = half.size
+    if half.side == "full":
+        return (l, t, r, b)  # trim to detected content on all enabled edges
     if half.side == "left":
         return (l, t, w, b)  # keep inner (right) edge at the spine
     return (0, t, r, b)  # keep inner (left) edge at the spine
@@ -333,6 +425,7 @@ def crop_box_for_half(
 class ProcessResult:
     saved: int = 0
     skipped_empty: int = 0
+    skipped_pages: int = 0    # parts dropped by the user's skip setting
     output_dir: str = ""      # folder written to (folder mode)
     cbz_path: str = ""        # archive written to (cbz mode)
     errors: list[str] = field(default_factory=list)
@@ -371,6 +464,8 @@ def process_folder(
     skip_top: int = 0,
     skip_bottom: int = 0,
     detect_vertical: bool = False,
+    no_split_paths: set[str] | None = None,
+    skip_sides: dict[str, str] | None = None,
     progress=None,
 ) -> ProcessResult:
     """Analyze every file, then split and save according to the crop mode.
@@ -379,6 +474,12 @@ def process_folder(
     (one consensus crop for the whole batch) or ``CROP_INDIVIDUAL`` (each page
     cropped to its own content). *mode_overrides* optionally maps individual
     file paths to a per-page mode that takes precedence over the default.
+
+    *no_split_paths* is a set of file paths that should not be cut in half;
+    each is still cropped but emitted as a single page.
+
+    *skip_sides* optionally maps a file path to a skip option (``SKIP_LEFT``/
+    ``SKIP_RIGHT``/``SKIP_BOTH``) dropping those output halves for that page.
 
     The global consensus margins are always computed from the full batch, so a
     page set to ``CROP_GLOBAL`` uses the same crop whether or not other pages
@@ -390,9 +491,14 @@ def process_folder(
     *progress* is an optional callback ``fn(done, total, message)``.
     """
     overrides = mode_overrides or {}
+    no_split = no_split_paths or set()
+    skips_map = skip_sides or {}
 
     def mode_for(path: str) -> str:
         return overrides.get(path, crop_mode)
+
+    def skip_for(path: str) -> str:
+        return skips_map.get(path, SKIP_NONE)
 
     result = ProcessResult(output_dir=output_dir)
 
@@ -415,7 +521,7 @@ def process_folder(
                 analyses.append(
                     analyze_image(
                         path, threshold, skip_outer, skip_top, skip_bottom,
-                        detect_vertical,
+                        detect_vertical, no_split=path in no_split,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - report and continue
@@ -424,12 +530,13 @@ def process_folder(
         # Consensus margins from the whole batch, used by any global-mode page.
         margins = compute_uniform_margins(analyses)
 
-        # Count non-empty halves to determine zero-padding width.
+        # Count non-empty, non-skipped output parts for zero-padding width.
         count = sum(
             1
             for a in analyses
-            for half in (a.left, a.right)
-            if not half.is_empty
+            for part in a.output_parts(order)
+            if part is not None and not part.is_empty
+            and not is_part_skipped(skip_for(a.path), part.side)
         )
         pad_width = len(str(count)) if count > 0 else 1
 
@@ -448,15 +555,22 @@ def process_folder(
             try:
                 with Image.open(a.path) as img:
                     img = img.convert("RGB")
-                    left_img, right_img = split_halves(img)
-                    halves = {"left": left_img, "right": right_img}
+                    if a.no_split:
+                        sources = {"full": img}
+                    else:
+                        left_img, right_img = split_halves(img)
+                        sources = {"left": left_img, "right": right_img}
                     page_mode = mode_for(a.path)
-                    for half_res in a.ordered_halves(order):
-                        box = crop_box_for_half(half_res, page_mode, margins)
+                    page_skip = skip_for(a.path)
+                    for part in a.output_parts(order):
+                        if is_part_skipped(page_skip, part.side):
+                            result.skipped_pages += 1
+                            continue
+                        box = crop_box_for_half(part, page_mode, margins)
                         if box is None:
                             result.skipped_empty += 1
                             continue
-                        src = halves[half_res.side]
+                        src = sources[part.side]
                         cropped = src.crop(box)
                         index += 1
                         name = f"{str(index).zfill(pad_width)}.png"

@@ -52,6 +52,11 @@ class SplitterApp(tk.Tk):
         # Per-page crop overrides: path -> CROP_GLOBAL/CROP_INDIVIDUAL.
         # Absent means "follow the batch default".
         self.mode_overrides: dict[str, str] = {}
+        # Pages the user marked to not be split (still cropped).
+        self.no_split_paths: set[str] = set()
+        # Per-page skip of output halves: path -> SKIP_LEFT/RIGHT/BOTH.
+        # Absent means SKIP_NONE.
+        self.skip_sides: dict[str, str] = {}
         self._preview_photo = None  # keep a reference so it isn't GC'd
 
         self._build_ui()
@@ -198,20 +203,24 @@ class SplitterApp(tk.Tk):
         left_frame.rowconfigure(0, weight=1)
         left_frame.columnconfigure(0, weight=1)
 
-        columns = ("name", "height", "crop")
+        columns = ("name", "height", "crop", "split", "skip")
         self.tree = ttk.Treeview(
             left_frame, columns=columns, show="headings", selectmode="browse"
         )
         self.tree.heading("name", text="File")
         self.tree.heading("height", text="Height")
         self.tree.heading("crop", text="Crop")
-        self.tree.column("name", width=210, anchor="w")
-        self.tree.column("height", width=60, anchor="center")
+        self.tree.heading("split", text="Split")
+        self.tree.heading("skip", text="Skip")
+        self.tree.column("name", width=150, anchor="w")
+        self.tree.column("height", width=55, anchor="center")
         self.tree.column("crop", width=90, anchor="center")
+        self.tree.column("split", width=55, anchor="center")
+        self.tree.column("skip", width=60, anchor="center")
         self.tree.tag_configure("mismatch", background="#f7b7b7")
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self.update_preview())
-        # Click the Crop column to cycle a page's override; right-click for menu.
+        # Click Crop/Split columns to toggle a page's setting; right-click menu.
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Button-3>", self._on_tree_right_click)
 
@@ -222,7 +231,7 @@ class SplitterApp(tk.Tk):
         vsb.grid(row=0, column=1, sticky="ns")
         ttk.Label(
             left_frame,
-            text="Click the Crop cell to cycle a page's mode (right-click for options).",
+            text="Click Crop / Split / Skip cells to change a page (right-click for options).",
             foreground="#888",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         main.add(left_frame, weight=1)
@@ -241,6 +250,22 @@ class SplitterApp(tk.Tk):
             label=f"Force {iu.CROP_INDIVIDUAL}",
             command=lambda: self._set_override(iu.CROP_INDIVIDUAL),
         )
+        self.crop_menu.add_separator()
+        self.crop_menu.add_command(
+            label="Split in half",
+            command=lambda: self._set_no_split(False),
+        )
+        self.crop_menu.add_command(
+            label="Don't split (crop only)",
+            command=lambda: self._set_no_split(True),
+        )
+        self.crop_menu.add_separator()
+        for opt in iu.SKIP_OPTIONS:
+            label = "Skip: none" if opt == iu.SKIP_NONE else f"Skip: {opt.lower()}"
+            self.crop_menu.add_command(
+                label=label,
+                command=lambda o=opt: self._set_skip_side(o),
+            )
         self._menu_target: str | None = None
 
         # Preview
@@ -309,6 +334,8 @@ class SplitterApp(tk.Tk):
         self.files = iu.list_image_files(folder)
         self.sizes.clear()
         self.mode_overrides.clear()
+        self.no_split_paths.clear()
+        self.skip_sides.clear()
         self.tree.delete(*self.tree.get_children())
 
         if not folder or not os.path.isdir(folder):
@@ -327,7 +354,11 @@ class SplitterApp(tk.Tk):
             self.sizes[path] = size
             self.tree.insert(
                 "", "end", iid=path,
-                values=(os.path.basename(path), size[1], self._crop_label(path)),
+                values=(
+                    os.path.basename(path), size[1],
+                    self._crop_label(path), self._split_label(path),
+                    self._skip_label(path),
+                ),
             )
 
         # Default desired height to the most common height.
@@ -374,9 +405,77 @@ class SplitterApp(tk.Tk):
     def _effective_mode(self, path: str) -> str:
         return self.mode_overrides.get(path, self.crop_mode.get())
 
+    def _split_label(self, path: str) -> str:
+        return "No" if path in self.no_split_paths else "Yes"
+
     def _refresh_crop_cell(self, path: str):
         if self.tree.exists(path):
             self.tree.set(path, "crop", self._crop_label(path))
+
+    def _refresh_split_cell(self, path: str):
+        if self.tree.exists(path):
+            self.tree.set(path, "split", self._split_label(path))
+
+    def _set_no_split(self, no_split: bool):
+        """Set the no-split flag for the current menu target."""
+        path = self._menu_target
+        if path is None:
+            return
+        if no_split:
+            self.no_split_paths.add(path)
+        else:
+            self.no_split_paths.discard(path)
+        self._refresh_split_cell(path)
+        self._gm_key = None  # split change affects consensus margins
+        sel = self.tree.selection()
+        if sel and sel[0] == path:
+            self.update_preview()
+
+    def _toggle_no_split(self, path: str):
+        if path in self.no_split_paths:
+            self.no_split_paths.discard(path)
+        else:
+            self.no_split_paths.add(path)
+        self._refresh_split_cell(path)
+        self._gm_key = None
+        sel = self.tree.selection()
+        if sel and sel[0] == path:
+            self.update_preview()
+
+    def _skip_label(self, path: str) -> str:
+        return self.skip_sides.get(path, iu.SKIP_NONE)
+
+    def _refresh_skip_cell(self, path: str):
+        if self.tree.exists(path):
+            self.tree.set(path, "skip", self._skip_label(path))
+
+    def _set_skip_side(self, option: str):
+        """Set the skip option for the current menu target."""
+        path = self._menu_target
+        if path is None:
+            return
+        if option == iu.SKIP_NONE:
+            self.skip_sides.pop(path, None)
+        else:
+            self.skip_sides[path] = option
+        self._refresh_skip_cell(path)
+        sel = self.tree.selection()
+        if sel and sel[0] == path:
+            self.update_preview()
+
+    def _cycle_skip_side(self, path: str):
+        """Cycle: None -> Left -> Right -> Both -> None."""
+        order = iu.SKIP_OPTIONS
+        current = self.skip_sides.get(path, iu.SKIP_NONE)
+        nxt = order[(order.index(current) + 1) % len(order)]
+        if nxt == iu.SKIP_NONE:
+            self.skip_sides.pop(path, None)
+        else:
+            self.skip_sides[path] = nxt
+        self._refresh_skip_cell(path)
+        sel = self.tree.selection()
+        if sel and sel[0] == path:
+            self.update_preview()
 
     def _refresh_all_crop_cells(self):
         for path in self.files:
@@ -417,17 +516,24 @@ class SplitterApp(tk.Tk):
             self.update_preview()
 
     def _on_tree_click(self, event):
-        # Only react to clicks in the Crop column; let normal selection happen
-        # otherwise.
+        # React to clicks in the Crop (#3) and Split (#4) columns; otherwise
+        # let normal row selection happen.
         region = self.tree.identify("region", event.x, event.y)
         if region != "cell":
             return
-        if self.tree.identify_column(event.x) != "#3":  # crop is 3rd column
-            return
+        col = self.tree.identify_column(event.x)
         row = self.tree.identify_row(event.y)
-        if row:
+        if not row:
+            return
+        if col == "#3":  # Crop
             self._cycle_override(row)
-            return "break"  # don't change selection on a crop-cell click
+            return "break"
+        if col == "#4":  # Split
+            self._toggle_no_split(row)
+            return "break"
+        if col == "#5":  # Skip
+            self._cycle_skip_side(row)
+            return "break"
 
     def _on_tree_right_click(self, event):
         row = self.tree.identify_row(event.y)
@@ -481,11 +587,14 @@ class SplitterApp(tk.Tk):
         crop_mode = self._effective_mode(path)
         skips = self._skip_values()
         detect_v = self.detect_vertical.get()
+        no_split = path in self.no_split_paths
+        skip_side = self.skip_sides.get(path, iu.SKIP_NONE)
 
         def work():
             try:
                 base = self._build_preview_image(
-                    path, threshold, crop_mode, skips, detect_v
+                    path, threshold, crop_mode, skips, detect_v, no_split,
+                    skip_side,
                 )
             except Exception as exc:  # noqa: BLE001
                 self.after(0, lambda: self.status.set(f"Preview error: {exc}"))
@@ -499,14 +608,18 @@ class SplitterApp(tk.Tk):
         self, threshold: int, skips: tuple[int, int, int], detect_v: bool
     ):
         """Consensus margins across all files, cached per input parameters."""
-        key = (tuple(self.files), threshold, skips, detect_v)
+        no_split = frozenset(self.no_split_paths)
+        key = (tuple(self.files), threshold, skips, detect_v, no_split)
         if getattr(self, "_gm_key", None) == key:
             return self._gm_value
         analyses = []
         for p in self.files:
             try:
                 analyses.append(
-                    iu.analyze_image(p, threshold, *skips, detect_v)
+                    iu.analyze_image(
+                        p, threshold, *skips, detect_v,
+                        no_split=p in no_split,
+                    )
                 )
             except Exception:  # noqa: BLE001 - skip unreadable in preview
                 continue
@@ -517,7 +630,8 @@ class SplitterApp(tk.Tk):
 
     def _build_preview_image(
         self, path: str, threshold: int, crop_mode: str,
-        skips: tuple[int, int, int], detect_v: bool,
+        skips: tuple[int, int, int], detect_v: bool, no_split: bool,
+        skip_side: str = iu.SKIP_NONE,
     ) -> Image.Image:
         """Return a copy of the source annotated with detection overlays.
 
@@ -525,7 +639,9 @@ class SplitterApp(tk.Tk):
         own content box in individual mode, or the shared consensus box in
         global mode (so the preview matches what will actually be saved).
         """
-        analysis = iu.analyze_image(path, threshold, *skips, detect_v)
+        analysis = iu.analyze_image(
+            path, threshold, *skips, detect_v, no_split=no_split
+        )
         global_margins = (
             self._global_margins(threshold, skips, detect_v)
             if crop_mode == iu.CROP_GLOBAL
@@ -550,13 +666,37 @@ class SplitterApp(tk.Tk):
         if detect_v and skip_bottom > 0:
             draw.rectangle([0, h - skip_bottom, w, h], fill=shade)
 
+        line_w = max(2, w // 400)
+        skip_shade = (220, 40, 40, 110)  # red tint over skipped parts
+        if no_split:
+            # Whole-page crop box, no split line.
+            if iu.is_part_skipped(skip_side, "full"):
+                draw.rectangle([0, 0, w, h], fill=skip_shade)
+            else:
+                box = iu.crop_box_for_half(
+                    analysis.full, crop_mode, global_margins
+                )
+                if box is not None:
+                    l, t, r, b = box
+                    draw.rectangle(
+                        [l, t, r - 1, b - 1],
+                        outline=(60, 220, 60),
+                        width=line_w,
+                    )
+            return annotated
+
         # Split line
-        draw.line([(mid, 0), (mid, h)], fill=(70, 130, 255), width=max(2, w // 400))
+        draw.line([(mid, 0), (mid, h)], fill=(70, 130, 255), width=line_w)
 
         # Crop boxes (outer padding trimmed, spine edge kept), offset to their
         # position in the full image. Box depends on the selected crop mode.
         offsets = {"left": 0, "right": w - mid}
+        half_spans = {"left": (0, mid), "right": (mid, w)}
         for half in (analysis.left, analysis.right):
+            if iu.is_part_skipped(skip_side, half.side):
+                x0, x1 = half_spans[half.side]
+                draw.rectangle([x0, 0, x1, h], fill=skip_shade)
+                continue
             box = iu.crop_box_for_half(half, crop_mode, global_margins)
             if box is None:
                 continue
@@ -565,7 +705,7 @@ class SplitterApp(tk.Tk):
             draw.rectangle(
                 [l + ox, t, r + ox - 1, b - 1],
                 outline=(60, 220, 60),
-                width=max(2, w // 400),
+                width=line_w,
             )
         return annotated
 
@@ -603,6 +743,8 @@ class SplitterApp(tk.Tk):
         cbz_path = self._resolve_cbz_path() if create_cbz else None
         skip_outer, skip_top, skip_bottom = self._skip_values()
         detect_vertical = self.detect_vertical.get()
+        no_split_paths = set(self.no_split_paths)
+        skip_sides = dict(self.skip_sides)
 
         self.process_btn.configure(state="disabled")
         self.progress.configure(value=0, maximum=len(self.files) * 2)
@@ -618,6 +760,7 @@ class SplitterApp(tk.Tk):
                     create_cbz=create_cbz, cbz_path=cbz_path,
                     skip_outer=skip_outer, skip_top=skip_top,
                     skip_bottom=skip_bottom, detect_vertical=detect_vertical,
+                    no_split_paths=no_split_paths, skip_sides=skip_sides,
                     progress=on_progress,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -644,8 +787,11 @@ class SplitterApp(tk.Tk):
         destination = result.cbz_path or result.output_dir
         summary = (
             f"Saved {result.saved} page(s) to {destination}. "
-            f"Skipped {result.skipped_empty} empty half/halves."
+            f"Skipped {result.skipped_empty} empty half/halves"
         )
+        if result.skipped_pages:
+            summary += f", {result.skipped_pages} page(s) by skip setting"
+        summary += "."
         self.status.set(summary)
         if result.errors:
             messagebox.showwarning(
