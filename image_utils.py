@@ -9,6 +9,7 @@ box* so all output pages share consistent framing ("uniform padding").
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
 import zipfile
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 # Extensions we treat as images.
 IMAGE_EXTENSIONS = {
@@ -196,6 +199,40 @@ def content_bbox(
     if left >= right or top >= bottom:
         return None  # entirely padding
     return (left, top, right, bottom)
+
+
+GRAYSCALE_TOLERANCE = 16   # default per-pixel channel-spread tolerance
+GRAYSCALE_MAX_COLOR_RATIO = 0.002  # fraction of colored pixels still allowed
+
+
+def is_grayscale(
+    img: Image.Image,
+    tolerance: int = GRAYSCALE_TOLERANCE,
+    max_color_ratio: float = GRAYSCALE_MAX_COLOR_RATIO,
+) -> bool:
+    """Whether an image carries no meaningful color.
+
+    Already single-channel modes (``L``/``1``/``I``) are trivially grayscale.
+    Otherwise the per-pixel spread between the max and min RGB channel is
+    measured. A pixel counts as "colored" when its spread exceeds *tolerance*;
+    the image is treated as grayscale when the fraction of colored pixels stays
+    at or below *max_color_ratio*. Using a small ratio instead of a hard
+    "no pixel may differ" rule keeps a few stray noisy/JPEG-artifact pixels
+    from forcing an otherwise neutral page to stay RGB, while a genuinely
+    colored page (many colored pixels) is still kept in color.
+
+    *tolerance* is the main knob: 0 demands exact gray, higher values absorb
+    more scan/compression color noise. Pages kept as single-channel grayscale
+    save roughly two thirds of the pixel data.
+    """
+    if img.mode in ("L", "1", "I", "I;16"):
+        return True
+    arr = np.asarray(img.convert("RGB")).astype(np.int16)
+    spread = arr.max(axis=2) - arr.min(axis=2)
+    if spread.size == 0:
+        return True
+    colored = int(np.count_nonzero(spread > tolerance))
+    return colored <= max_color_ratio * spread.size
 
 
 def _half_to_array(half: Image.Image) -> np.ndarray:
@@ -426,6 +463,7 @@ class ProcessResult:
     saved: int = 0
     skipped_empty: int = 0
     skipped_pages: int = 0    # parts dropped by the user's skip setting
+    grayscale: int = 0        # pages saved as single-channel grayscale
     output_dir: str = ""      # folder written to (folder mode)
     cbz_path: str = ""        # archive written to (cbz mode)
     errors: list[str] = field(default_factory=list)
@@ -464,6 +502,8 @@ def process_folder(
     skip_top: int = 0,
     skip_bottom: int = 0,
     detect_vertical: bool = False,
+    detect_grayscale: bool = False,
+    grayscale_tolerance: int = GRAYSCALE_TOLERANCE,
     no_split_paths: set[str] | None = None,
     skip_sides: dict[str, str] | None = None,
     progress=None,
@@ -480,6 +520,12 @@ def process_folder(
 
     *skip_sides* optionally maps a file path to a skip option (``SKIP_LEFT``/
     ``SKIP_RIGHT``/``SKIP_BOTH``) dropping those output halves for that page.
+
+    *detect_grayscale* saves each output page as single-channel grayscale when
+    it carries no meaningful color (see :func:`is_grayscale`), reducing the
+    file size of pages that only look colored because of scan noise.
+    *grayscale_tolerance* controls how much per-pixel color spread is tolerated
+    before a page is considered truly colored (higher = more forgiving).
 
     The global consensus margins are always computed from the full batch, so a
     page set to ``CROP_GLOBAL`` uses the same crop whether or not other pages
@@ -502,14 +548,26 @@ def process_folder(
 
     result = ProcessResult(output_dir=output_dir)
 
+    destination = cbz_path if create_cbz else output_dir
+    logger.info(
+        "Processing %d file(s) -> %s (order=%s, threshold=%d, crop_mode=%s, "
+        "detect_vertical=%s, detect_grayscale=%s, grayscale_tolerance=%d, "
+        "no_split=%d, overrides=%d)",
+        len(files), destination, order, threshold, crop_mode,
+        detect_vertical, detect_grayscale, grayscale_tolerance,
+        len(no_split), len(overrides),
+    )
+
     # Set up the chosen output sink.
     zf = None
     if create_cbz:
         result.cbz_path = cbz_path or ""
         os.makedirs(os.path.dirname(os.path.abspath(cbz_path)), exist_ok=True)
         zf = zipfile.ZipFile(cbz_path, "w", zipfile.ZIP_DEFLATED)
+        logger.info("Writing output to CBZ archive: %s", cbz_path)
     else:
         os.makedirs(output_dir, exist_ok=True)
+        logger.info("Writing output to folder: %s", output_dir)
 
     try:
         total = len(files)
@@ -525,10 +583,14 @@ def process_folder(
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - report and continue
+                logger.exception("Failed to analyze %s", path)
                 result.errors.append(f"{os.path.basename(path)}: {exc}")
+
+        logger.info("Analyzed %d/%d file(s).", len(analyses), total)
 
         # Consensus margins from the whole batch, used by any global-mode page.
         margins = compute_uniform_margins(analyses)
+        logger.debug("Consensus margins (outer, top, bottom): %s", margins)
 
         # Count non-empty, non-skipped output parts for zero-padding width.
         count = sum(
@@ -572,11 +634,17 @@ def process_folder(
                             continue
                         src = sources[part.side]
                         cropped = src.crop(box)
+                        if detect_grayscale and is_grayscale(
+                            cropped, grayscale_tolerance
+                        ):
+                            cropped = cropped.convert("L")
+                            result.grayscale += 1
                         index += 1
                         name = f"{str(index).zfill(pad_width)}.png"
                         emit(name, cropped)
                         result.saved += 1
             except Exception as exc:  # noqa: BLE001
+                logger.exception("Failed to save output for %s", a.path)
                 result.errors.append(f"{os.path.basename(a.path)}: {exc}")
     finally:
         if zf is not None:
@@ -584,4 +652,16 @@ def process_folder(
 
     if progress:
         progress(total, total, "Done")
+    logger.info(
+        "Done: saved %d page(s), skipped %d empty, %d by skip setting, "
+        "%d error(s).",
+        result.saved, result.skipped_empty, result.skipped_pages,
+        len(result.errors),
+    )
+    if detect_grayscale:
+        logger.info(
+            "Grayscale detection: saved %d/%d page(s) as single-channel "
+            "grayscale.",
+            result.grayscale, result.saved,
+        )
     return result

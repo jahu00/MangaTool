@@ -13,7 +13,9 @@ Workflow:
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -22,6 +24,8 @@ from PIL import Image, ImageDraw, ImageTk
 
 import image_utils as iu
 import presets as pr
+
+logger = logging.getLogger(__name__)
 
 
 class SplitterApp(tk.Tk):
@@ -46,6 +50,10 @@ class SplitterApp(tk.Tk):
         self.skip_bottom = tk.IntVar(value=0)
         # Optional top/bottom margin detection (off by default).
         self.detect_vertical = tk.BooleanVar(value=False)
+        # Save grayscale-looking pages as single-channel to save space.
+        self.detect_grayscale = tk.BooleanVar(value=False)
+        # Per-pixel color-spread tolerance for grayscale detection.
+        self.grayscale_tolerance = tk.IntVar(value=iu.GRAYSCALE_TOLERANCE)
         self.status = tk.StringVar(value="Select an input folder to begin.")
 
         # Presets (global options, excluding CBZ settings).
@@ -71,6 +79,7 @@ class SplitterApp(tk.Tk):
         self._apply_settings(
             self.preset_store.get(pr.DEFAULT_PRESET_NAME)
         )
+        logger.info("UI initialized and default preset applied.")
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -177,6 +186,23 @@ class SplitterApp(tk.Tk):
             variable=self.detect_vertical,
             command=self._on_detect_vertical_toggle,
         ).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(
+            skip_row,
+            text="Detect grayscale",
+            variable=self.detect_grayscale,
+            command=self._on_detect_grayscale_toggle,
+        ).pack(side="left", padx=(0, 4))
+        self._gray_tol_label = ttk.Label(skip_row, text="Tolerance:")
+        self._gray_tol_label.pack(side="left", padx=(0, 2))
+        self._gray_tol_spin = ttk.Spinbox(
+            skip_row,
+            from_=0,
+            to=255,
+            increment=1,
+            textvariable=self.grayscale_tolerance,
+            width=5,
+        )
+        self._gray_tol_spin.pack(side="left", padx=(0, 16))
         ttk.Label(
             skip_row, text="Skip margin (px) before detection \u2014"
         ).pack(side="left")
@@ -344,6 +370,7 @@ class SplitterApp(tk.Tk):
         # Apply initial enabled/disabled state for the output widgets.
         self._on_cbz_toggle()
         self._on_detect_vertical_toggle()
+        self._on_detect_grayscale_toggle()
 
     # ------------------------------------------------------------ actions
     def _on_cbz_toggle(self):
@@ -371,6 +398,7 @@ class SplitterApp(tk.Tk):
 
     def load_files(self):
         folder = self.input_dir.get().strip()
+        logger.info("Loading files from input folder: %s", folder or "(empty)")
         self.files = iu.list_image_files(folder)
         self.sizes.clear()
         self.mode_overrides.clear()
@@ -379,10 +407,12 @@ class SplitterApp(tk.Tk):
         self.tree.delete(*self.tree.get_children())
 
         if not folder or not os.path.isdir(folder):
+            logger.warning("Input folder not found: %s", folder or "(empty)")
             self.status.set(f"Folder not found: {folder}" if folder
                             else "Enter an input folder path.")
             return
         if not self.files:
+            logger.warning("No image files found in folder: %s", folder)
             self.status.set("No image files found in that folder.")
             return
 
@@ -408,6 +438,7 @@ class SplitterApp(tk.Tk):
             self.desired_height.set(str(common))
 
         self.refresh_height_flags()
+        logger.info("Loaded %d file(s) from %s.", len(self.files), folder)
         self.status.set(f"Loaded {len(self.files)} file(s).")
         # Select first row to show a preview.
         first = self.tree.get_children()
@@ -594,6 +625,8 @@ class SplitterApp(tk.Tk):
             "skip_top": self.skip_top.get(),
             "skip_bottom": self.skip_bottom.get(),
             "detect_vertical": self.detect_vertical.get(),
+            "detect_grayscale": self.detect_grayscale.get(),
+            "grayscale_tolerance": self.grayscale_tolerance.get(),
         })
 
     def _apply_settings(self, settings: dict):
@@ -607,8 +640,11 @@ class SplitterApp(tk.Tk):
         self.skip_top.set(s["skip_top"])
         self.skip_bottom.set(s["skip_bottom"])
         self.detect_vertical.set(s["detect_vertical"])
+        self.detect_grayscale.set(s["detect_grayscale"])
+        self.grayscale_tolerance.set(s["grayscale_tolerance"])
         # Refresh things that react to these values.
         self._on_detect_vertical_toggle()
+        self._on_detect_grayscale_toggle()
         self.refresh_height_flags()
         self._refresh_all_crop_cells()
         self._gm_key = None
@@ -732,6 +768,12 @@ class SplitterApp(tk.Tk):
             lbl.configure(foreground=fg)
         self._gm_key = None
         self.update_preview()
+
+    def _on_detect_grayscale_toggle(self):
+        # The tolerance control only matters when grayscale detection is on.
+        on = self.detect_grayscale.get()
+        self._gray_tol_spin.configure(state="normal" if on else "disabled")
+        self._gray_tol_label.configure(foreground="#000" if on else "#bbb")
 
     def update_preview(self):
         sel = self.tree.selection()
@@ -887,6 +929,7 @@ class SplitterApp(tk.Tk):
 
     def process(self):
         if not self.files:
+            logger.warning("Process requested with no files loaded.")
             messagebox.showwarning("No files", "Load an input folder first.")
             return
         order = self.order.get()
@@ -898,9 +941,15 @@ class SplitterApp(tk.Tk):
         cbz_path = self._resolve_cbz_path() if create_cbz else None
         skip_outer, skip_top, skip_bottom = self._skip_values()
         detect_vertical = self.detect_vertical.get()
+        detect_grayscale = self.detect_grayscale.get()
+        grayscale_tolerance = self.grayscale_tolerance.get()
         no_split_paths = set(self.no_split_paths)
         skip_sides = dict(self.skip_sides)
 
+        logger.info(
+            "Starting processing of %d file(s) (create_cbz=%s).",
+            len(self.files), create_cbz,
+        )
         self.process_btn.configure(state="disabled")
         self.progress.configure(value=0, maximum=len(self.files) * 2)
 
@@ -915,6 +964,8 @@ class SplitterApp(tk.Tk):
                     create_cbz=create_cbz, cbz_path=cbz_path,
                     skip_outer=skip_outer, skip_top=skip_top,
                     skip_bottom=skip_bottom, detect_vertical=detect_vertical,
+                    detect_grayscale=detect_grayscale,
+                    grayscale_tolerance=grayscale_tolerance,
                     no_split_paths=no_split_paths, skip_sides=skip_sides,
                     progress=on_progress,
                 )
@@ -932,6 +983,7 @@ class SplitterApp(tk.Tk):
         self.status.set(msg)
 
     def _process_failed(self, exc):
+        logger.error("Processing failed: %s", exc, exc_info=exc)
         self.process_btn.configure(state="normal")
         messagebox.showerror("Processing failed", str(exc))
         self.status.set("Processing failed.")
@@ -948,7 +1000,12 @@ class SplitterApp(tk.Tk):
             summary += f", {result.skipped_pages} page(s) by skip setting"
         summary += "."
         self.status.set(summary)
+        logger.info(summary)
         if result.errors:
+            logger.warning(
+                "Processing completed with %d error(s): %s",
+                len(result.errors), "; ".join(result.errors),
+            )
             messagebox.showwarning(
                 "Completed with errors",
                 summary + "\n\nErrors:\n" + "\n".join(result.errors[:20]),
@@ -1073,5 +1130,29 @@ class PresetManager(tk.Toplevel):
         self._reload(select=pr.DEFAULT_PRESET_NAME)
 
 
+def _configure_logging():
+    """Send application logs to stdout.
+
+    The level can be overridden with the ``MANGATOOL_LOG_LEVEL`` env var
+    (e.g. ``DEBUG``); it defaults to ``INFO``.
+    """
+    level_name = os.environ.get("MANGATOOL_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
 if __name__ == "__main__":
-    SplitterApp().mainloop()
+    _configure_logging()
+    logger.info("Starting MangaTool image splitter.")
+    try:
+        SplitterApp().mainloop()
+    except Exception:
+        logger.exception("Unhandled exception; exiting.")
+        raise
+    finally:
+        logger.info("MangaTool exited.")

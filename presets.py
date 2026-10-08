@@ -10,9 +10,12 @@ always recoverable via :data:`ORIGINAL_DEFAULTS`.
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 import image_utils as iu
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PRESET_NAME = "Default"
 
@@ -28,6 +31,8 @@ ORIGINAL_DEFAULTS: dict = {
     "skip_top": 0,
     "skip_bottom": 0,
     "detect_vertical": False,
+    "detect_grayscale": False,
+    "grayscale_tolerance": iu.GRAYSCALE_TOLERANCE,
 }
 
 # The settings keys a preset stores (order defines nothing functional).
@@ -77,7 +82,11 @@ class PresetStore:
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            logger.info(
+                "No usable presets file at %s (%s); using defaults.",
+                self.path, exc,
+            )
             data = {}
         raw = data.get("presets", {}) if isinstance(data, dict) else {}
         self.presets = {
@@ -88,11 +97,15 @@ class PresetStore:
         # Guarantee the Default preset exists.
         if DEFAULT_PRESET_NAME not in self.presets:
             self.presets[DEFAULT_PRESET_NAME] = dict(ORIGINAL_DEFAULTS)
+        logger.info(
+            "Loaded %d preset(s) from %s.", len(self.presets), self.path
+        )
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as fh:
             json.dump({"presets": self.presets}, fh, indent=2)
+        logger.info("Saved %d preset(s) to %s.", len(self.presets), self.path)
 
     # ------------------------------------------------------------- queries
     def names(self) -> list[str]:

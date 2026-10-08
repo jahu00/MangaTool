@@ -250,6 +250,76 @@ def main():
         print("skip-pages saved:", res_sk.saved,
               "skipped_pages:", res_sk.skipped_pages)
 
+        # Grayscale detection: a neutral-gray scan (with slight channel noise)
+        # should be saved as single-channel "L"; a page with real color stays
+        # RGB. Without the flag everything stays RGB.
+        gs_dir = os.path.join(d, "grayscale_test")
+        os.makedirs(gs_dir)
+        gray_page = os.path.join(gs_dir, "1.png")
+        color_page = os.path.join(gs_dir, "2.png")
+        # neutral gray content with a few pixels of mild channel noise
+        g = Image.new("RGB", (400, 600), (255, 255, 255))
+        gpx = g.load()
+        for x in range(30, 370):
+            for y in range(40, 560):
+                gpx[x, y] = (40, 40, 40)
+        gpx[100, 100] = (48, 40, 40)  # tiny noise within tolerance
+        g.save(gray_page)
+        # genuinely colored content on both halves
+        c = Image.new("RGB", (400, 600), (255, 255, 255))
+        cpx = c.load()
+        for x in range(30, 370):
+            for y in range(40, 560):
+                cpx[x, y] = (200, 20, 20)
+        c.save(color_page)
+
+        assert iu.is_grayscale(Image.open(gray_page)) is True
+        assert iu.is_grayscale(Image.open(color_page)) is False
+
+        # Tolerance knob: a page with a mild uniform color tint (spread 20) is
+        # colored at the default tolerance (16) but grayscale once tolerance is
+        # raised above the tint.
+        tint = Image.new("RGB", (400, 600), (255, 255, 255))
+        tpx = tint.load()
+        for x in range(30, 370):
+            for y in range(40, 560):
+                tpx[x, y] = (60, 50, 40)  # max-min spread = 20
+        assert iu.is_grayscale(tint, tolerance=16) is False
+        assert iu.is_grayscale(tint, tolerance=25) is True
+        print("tolerance knob OK (16 -> color, 25 -> gray)")
+
+        # A handful of stray colored pixels should not force an otherwise
+        # neutral page to RGB (ratio-based decision).
+        speckle = Image.new("RGB", (400, 600), (40, 40, 40))
+        spx = speckle.load()
+        for i in range(50):  # 50 colored pixels out of 240000 (~0.02%)
+            spx[i, 0] = (200, 10, 10)
+        assert iu.is_grayscale(speckle) is True
+        print("stray-pixel tolerance OK")
+
+        out_gs = os.path.join(gs_dir, "output")
+        iu.process_folder(
+            [gray_page, color_page], out_gs, iu.LEFT_TO_RIGHT, threshold=25,
+            crop_mode=iu.CROP_GLOBAL, detect_vertical=True,
+            detect_grayscale=True,
+        )
+        modes_gs = {n: Image.open(os.path.join(out_gs, n)).mode
+                    for n in sorted(os.listdir(out_gs))}
+        # First two outputs are the gray page's halves (L), last two colored (RGB).
+        assert list(modes_gs.values()) == ["L", "L", "RGB", "RGB"], modes_gs
+        print("grayscale-detected modes:", modes_gs)
+
+        # Without the flag, the gray page stays RGB.
+        out_gs_off = os.path.join(gs_dir, "output_off")
+        iu.process_folder(
+            [gray_page, color_page], out_gs_off, iu.LEFT_TO_RIGHT, threshold=25,
+            crop_mode=iu.CROP_GLOBAL, detect_vertical=True,
+        )
+        modes_off = {Image.open(os.path.join(out_gs_off, n)).mode
+                     for n in os.listdir(out_gs_off)}
+        assert modes_off == {"RGB"}, modes_off
+        print("grayscale-off modes:", modes_off)
+
     print("ALL OK")
 
 
